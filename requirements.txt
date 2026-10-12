@@ -4,3 +4,4 @@ pandas
 numpy
 ccxt
 scikit-learn
+supabase

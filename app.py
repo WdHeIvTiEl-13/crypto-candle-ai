@@ -18,7 +18,7 @@ st.caption("Experimental ML model • Paper testing only")
 
 coin = st.selectbox(
     "Crypto Pair",
-    ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT"]
+    ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"]
 )
 
 timeframe = st.selectbox(
@@ -64,9 +64,9 @@ def make_features(df):
 if st.button("🤖 Train Model & Predict Next Candle"):
     try:
         with st.spinner("Fetching market data and training model..."):
-            exchange = ccxt.binance({
-                "enableRateLimit": True
-            })
+            exchange = ccxt.kraken({
+    "enableRateLimit": True
+})
 
             candles = exchange.fetch_ohlcv(
                 coin,

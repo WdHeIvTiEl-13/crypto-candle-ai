@@ -493,13 +493,57 @@ try:
         )
 
         # Display price values and movement measurements.
+        # Ensure columns exist, including for older records.
         for col in [
-            "close_price", "outcome_open", "outcome_close",
-            "outcome_high", "outcome_low",
-            "body_change_pct", "full_range_pct"
+            "close_price",
+            "outcome_open",
+            "outcome_close",
+            "outcome_high",
+            "outcome_low",
+            "body_change_pct",
+            "full_range_pct",
+            "actual",
+            "prediction",
+            "created_at",
+            "coin",
+            "timeframe"
         ]:
             if col not in history.columns:
                 history[col] = np.nan
+
+        history["Prediction"] = history["prediction"].map(
+            {1: "UP", 0: "DOWN"}
+        )
+
+        history["Outcome"] = history["actual"].map(
+            {1: "UP", 0: "DOWN"}
+        ).fillna("Pending")
+
+        def movement_label(value):
+            if pd.isna(value):
+                return "Pending"
+
+            value = abs(float(value))
+
+            if value < 0.1:
+                return "Small move"
+            elif value < 0.5:
+                return "Moderate move"
+
+            return "Large move"
+
+        history["Movement"] = history[
+            "body_change_pct"
+        ].apply(movement_label)
+
+        history["Correct?"] = history.apply(
+            lambda row: (
+                "Yes"
+                if int(row["prediction"]) == int(row["actual"])
+                else "No"
+            ) if pd.notna(row["actual"]) else "Pending",
+            axis=1
+        )
 
         display = history[[
             "created_at",

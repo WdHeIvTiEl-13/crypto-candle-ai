@@ -430,6 +430,24 @@ try:
 
     history = pd.DataFrame(response.data or [])
 
+    for col in [
+        "body_change_pct",
+        "full_range_pct",
+        "outcome_open",
+        "outcome_close",
+        "outcome_high",
+        "outcome_low",
+        "actual",
+        "prediction",
+        "created_at",
+        "coin",
+        "timeframe",
+        "close_price"
+    ]:
+        if col not in history.columns:
+            history[col] = np.nan
+
+    
     if history.empty:
         st.info(
             "No predictions yet. Record your first prediction above."

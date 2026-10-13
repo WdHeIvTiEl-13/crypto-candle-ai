@@ -2,53 +2,30 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import ccxt
-
 from datetime import datetime, timezone
 from supabase import create_client
-from streamlit_autorefresh import st_autorefresh
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score
 
+st.set_page_config(page_title="Crypto Candle AI", page_icon="📈", layout="wide")
+st.title("📈 Crypto Candle AI")
+st.caption("Educational paper testing only. Predictions are uncertain; this is not a trading signal service.")
 
-# =========================================
-# PAGE SETUP AND AUTO REFRESH
-# =========================================
-
-st.set_page_config(
-    page_title="Crypto Candle AI",
-    page_icon="📈",
-    layout="wide"
-)
-
-# Rerun this Streamlit page every 60 seconds.
-st_autorefresh(
-    interval=60_000,
-    limit=None,
-    key="crypto_auto_refresh"
-)
-
-st.title("📈 Crypto Candle Prediction AI")
-st.caption(
-    "Automatic refresh • Automatic prediction • Paper testing only"
-)
-
-st.caption(
-    "Last check (UTC): "
-    + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-)
-
-
-# =========================================
-# SUPABASE
-# =========================================
+PAIRS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"]
+TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
+DURATION = {
+    "1m": pd.Timedelta(minutes=1), "5m": pd.Timedelta(minutes=5),
+    "15m": pd.Timedelta(minutes=15), "1h": pd.Timedelta(hours=1),
+    "4h": pd.Timedelta(hours=4), "1d": pd.Timedelta(days=1),
+}
 
 @st.cache_resource
 def get_supabase():
-    return create_client(
-        st.secrets["SUPABASE_URL"],
-        st.secrets["SUPABASE_KEY"]
-    )
+    return create_client(st.secrets["SUPABASE_URL"], st.secrets["SUPABASE_KEY"])
 
+@st.cache_resource
+def get_exchange():
+    return ccxt.kraken({"enableRateLimit": True, "timeout": 20000})
 
 try:
     supabase = get_supabase()
@@ -56,646 +33,339 @@ except Exception as e:
     st.error(f"Supabase connection failed: {e}")
     st.stop()
 
-
-# =========================================
-# KRAKEN MARKET DATA
-# =========================================
-
-@st.cache_resource
-def get_exchange():
-    return ccxt.kraken({
-        "enableRateLimit": True
-    })
-
-
+@st.cache_data(ttl=15, show_spinner=False)
 def fetch_data(coin, timeframe):
-    exchange = get_exchange()
-
-    candles = exchange.fetch_ohlcv(
-        coin,
-        timeframe=timeframe,
-        limit=1000
-    )
-
+    candles = get_exchange().fetch_ohlcv(coin, timeframe=timeframe, limit=1000)
     if not candles or len(candles) < 100:
-        raise ValueError("Not enough candle data.")
-
-    df = pd.DataFrame(
-        candles,
-        columns=[
-            "Time", "Open", "High",
-            "Low", "Close", "Volume"
-        ]
-    )
-
-    df["Time"] = pd.to_datetime(
-        df["Time"], unit="ms", utc=True
-    )
-
-    # Exclude the possibly unfinished current candle.
+        raise ValueError(f"Not enough candle data for {coin} {timeframe}.")
+    df = pd.DataFrame(candles, columns=["Time", "Open", "High", "Low", "Close", "Volume"])
+    df["Time"] = pd.to_datetime(df["Time"], unit="ms", utc=True)
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["Time", "Open", "High", "Low", "Close"])
+    df = df.sort_values("Time").drop_duplicates("Time", keep="last").reset_index(drop=True)
+    # Exclude the possibly unfinished latest candle.
     df = df.iloc[:-1].copy().reset_index(drop=True)
-
     if len(df) < 100:
         raise ValueError("Not enough completed candles.")
-
     return df
-
-
-# =========================================
-# FEATURE ENGINEERING
-# =========================================
 
 def features_for(df):
     f = pd.DataFrame(index=df.index)
     close = df["Close"]
-
     f["return_1"] = close.pct_change()
     f["return_3"] = close.pct_change(3)
     f["return_5"] = close.pct_change(5)
-
-    f["body"] = (
-        (df["Close"] - df["Open"]) / df["Open"]
-    )
-
-    f["range"] = (
-        (df["High"] - df["Low"]) / df["Open"]
-    )
-
+    f["body"] = (df["Close"] - df["Open"]) / df["Open"]
+    f["range"] = (df["High"] - df["Low"]) / df["Open"]
     for n in [5, 10, 20]:
-        f[f"sma_{n}"] = (
-            close / close.rolling(n).mean() - 1
-        )
-
+        f[f"sma_{n}"] = close / close.rolling(n).mean() - 1
     f["volume_change"] = df["Volume"].pct_change()
-
     delta = close.diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = (-delta.clip(upper=0)).rolling(14).mean()
-
     rs = gain / loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-
     rsi = rsi.mask((gain == 0) & (loss == 0), 50)
     rsi = rsi.mask((loss == 0) & (gain > 0), 100)
     rsi = rsi.mask((gain == 0) & (loss > 0), 0)
-
     f["rsi"] = rsi
-
     return f.replace([np.inf, -np.inf], np.nan)
 
-
-# =========================================
-# LATEST SAVED MODEL METRICS
-# =========================================
+def build_model():
+    return RandomForestClassifier(
+        n_estimators=200, max_depth=8, min_samples_leaf=5,
+        class_weight="balanced", random_state=42, n_jobs=-1
+    )
 
 def latest_model_metrics(coin, timeframe):
     try:
-        response = (
-            supabase.table("model_runs")
-            .select("test_accuracy,baseline_accuracy")
-            .eq("coin", coin)
-            .eq("timeframe", timeframe)
-            .order("trained_at", desc=True)
-            .limit(1)
-            .execute()
-        )
-
-        if response.data:
-            return response.data[0]
-
+        r = (supabase.table("model_runs").select("test_accuracy,baseline_accuracy")
+             .eq("coin", coin).eq("timeframe", timeframe)
+             .order("trained_at", desc=True).limit(1).execute())
+        return r.data[0] if r.data else {}
     except Exception:
-        pass
-
-    return {}
-
-
-# =========================================
-# AUTOMATIC PREDICTION
-# =========================================
+        return {}
 
 def make_prediction(coin, timeframe):
     df = fetch_data(coin, timeframe)
     f = features_for(df)
+    usable = f.dropna()
+    if usable.empty:
+        raise ValueError("Could not calculate latest candle features.")
 
-    latest_features = f.dropna()
-
-    if latest_features.empty:
-        raise ValueError("Could not calculate the latest features.")
-
-    latest_idx = latest_features.index[-1]
-    latest = latest_features.iloc[[-1]]
-
-    reference = df.loc[latest_idx]
-    candle_time = pd.Timestamp(reference["Time"]).isoformat()
+    idx = usable.index[-1]
+    latest = usable.iloc[[-1]]
+    reference = df.loc[idx]
+    ref_time = pd.Timestamp(reference["Time"]).tz_convert("UTC")
+    target_time = ref_time + DURATION[timeframe]
+    candle_time = ref_time.isoformat()
+    target_candle_time = target_time.isoformat()
     close_price = float(reference["Close"])
 
-    # Check before training: do not create another
-    # prediction for the same completed reference candle.
-    existing = (
-        supabase.table("predictions")
-        .select("id,prediction,up_probability")
-        .eq("coin", coin)
-        .eq("timeframe", timeframe)
-        .eq("candle_time", candle_time)
-        .limit(1)
-        .execute()
-    )
-
+    existing = (supabase.table("predictions")
+                .select("id,prediction,up_probability,target_candle_time")
+                .eq("coin", coin).eq("timeframe", timeframe)
+                .eq("candle_time", candle_time).limit(1).execute())
     if existing.data:
         saved = existing.data[0]
-
         return {
-            "is_new": False,
-            "prediction": int(saved["prediction"]),
-            "up_probability": saved.get("up_probability"),
-            "chart": df,
-            "candle_time": candle_time
+            "is_new": False, "prediction": int(saved["prediction"]),
+            "up_probability": saved.get("up_probability"), "chart": df,
+            "candle_time": candle_time,
+            "target_candle_time": saved.get("target_candle_time") or target_candle_time,
+            "reference_close": close_price, "test_accuracy": None,
+            "baseline_accuracy": None,
         }
 
-    # Label each candle by the next candle's
-    # close relative to that next candle's open.
-    target = (
-        df["Close"].shift(-1) > df["Open"].shift(-1)
-    ).astype(float)
-
+    # Label row t with the direction of candle t+1. The latest row is unlabeled.
+    target = (df["Close"].shift(-1) > df["Open"].shift(-1)).astype(float)
     target.iloc[-1] = np.nan
-
     training = f.copy()
     training["target"] = target
     training = training.dropna()
-
     if len(training) < 150:
-        raise ValueError("Not enough usable training data.")
+        raise ValueError("Not enough labelled data for model training.")
 
     X = training.drop(columns=["target"])
     y = training["target"].astype(int)
-
     split = int(len(training) * 0.8)
-
     if split < 100 or len(training) - split < 20:
-        raise ValueError("Not enough data for model testing.")
+        raise ValueError("Not enough rows for chronological holdout testing.")
 
-    # Chronological holdout test.
-    test_model = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=8,
-        min_samples_leaf=5,
-        class_weight="balanced",
-        random_state=42,
-        n_jobs=-1
-    )
-
+    test_model = build_model()
     test_model.fit(X.iloc[:split], y.iloc[:split])
-
-    test_predictions = test_model.predict(X.iloc[split:])
-
-    test_accuracy = float(
-        accuracy_score(y.iloc[split:], test_predictions)
-    )
-
+    test_pred = test_model.predict(X.iloc[split:])
+    test_accuracy = float(accuracy_score(y.iloc[split:], test_pred))
     baseline_label = int(y.iloc[:split].mode().iloc[0])
+    baseline_accuracy = float(accuracy_score(
+        y.iloc[split:], np.full(len(y.iloc[split:]), baseline_label)
+    ))
 
-    baseline_accuracy = float(
-        accuracy_score(
-            y.iloc[split:],
-            np.full(len(y.iloc[split:]), baseline_label)
-        )
-    )
-
-    # Fit the forecasting model using all labelled data.
-    model = RandomForestClassifier(
-        n_estimators=200,
-        max_depth=8,
-        min_samples_leaf=5,
-        class_weight="balanced",
-        random_state=42,
-        n_jobs=-1
-    )
-
+    model = build_model()
     model.fit(X, y)
-
     prediction = int(model.predict(latest)[0])
-
-    probabilities = model.predict_proba(latest)[0]
+    probs = model.predict_proba(latest)[0]
     classes = list(model.classes_)
-
-    up_probability = (
-        float(probabilities[classes.index(1)])
-        if 1 in classes else 0.0
-    )
+    up_probability = float(probs[classes.index(1)]) if 1 in classes else 0.0
 
     payload = {
-        "coin": coin,
-        "timeframe": timeframe,
-        "candle_time": candle_time,
-        "close_price": close_price,
-        "prediction": prediction,
-        "up_probability": up_probability
+        "coin": coin, "timeframe": timeframe, "candle_time": candle_time,
+        "target_candle_time": target_candle_time, "close_price": close_price,
+        "prediction": prediction, "up_probability": up_probability,
     }
-
-    # Insert rather than upsert so an existing prediction
-    # is not silently overwritten.
+    # Insert only; don't overwrite an existing prediction.
     supabase.table("predictions").insert(payload).execute()
-
-    # Save model test metrics for later display.
     try:
         supabase.table("model_runs").insert({
-            "coin": coin,
-            "timeframe": timeframe,
-            "train_rows": int(len(X)),
-            "test_accuracy": test_accuracy,
-            "baseline_accuracy": baseline_accuracy,
-            "accepted": False,
-            "model_version": "random-forest-v1",
-            "notes": "Chronological 80/20 holdout; paper testing"
+            "coin": coin, "timeframe": timeframe, "train_rows": int(len(X)),
+            "test_accuracy": test_accuracy, "baseline_accuracy": baseline_accuracy,
+            "accepted": False, "model_version": "random-forest-v2",
+            "notes": "Chronological 80/20 holdout; next candle direction; paper testing."
         }).execute()
     except Exception as e:
         st.warning(f"Prediction saved, but model metrics were not saved: {e}")
 
     return {
-        "is_new": True,
-        "prediction": prediction,
-        "up_probability": up_probability,
-        "test_accuracy": test_accuracy,
+        "is_new": True, "prediction": prediction,
+        "up_probability": up_probability, "chart": df,
+        "candle_time": candle_time, "target_candle_time": target_candle_time,
+        "reference_close": close_price, "test_accuracy": test_accuracy,
         "baseline_accuracy": baseline_accuracy,
-        "chart": df,
-        "candle_time": candle_time
     }
 
-
-# =========================================
-# OUTCOME EVALUATION
-# =========================================
-
-def resolve_pending(coin=None, timeframe=None, limit=100):
-    errors = []
-    updated = 0
-
+def resolve_pending(coin=None, timeframe=None, limit=200):
+    errors, updated = [], 0
     try:
-        query = (
-            supabase.table("predictions")
-            .select("*")
-            .is_("actual", "null")
-            .order("created_at", desc=True)
-            .limit(limit)
-        )
-
+        q = (supabase.table("predictions").select("*").is_("actual", "null")
+             .order("created_at", desc=False).limit(limit))
         if coin is not None:
-            query = query.eq("coin", coin)
-
+            q = q.eq("coin", coin)
         if timeframe is not None:
-            query = query.eq("timeframe", timeframe)
-
-        response = query.execute()
-        pending = response.data or []
-
+            q = q.eq("timeframe", timeframe)
+        pending = q.execute().data or []
     except Exception as e:
         return 0, [f"Could not load pending predictions: {e}"]
 
-    # Reuse candle data for records with the same market pair
-    # and timeframe during this evaluation pass.
-    data_cache = {}
-
+    candle_cache = {}
     for row in pending:
         try:
-            key = (row["coin"], row["timeframe"])
-
-            if key not in data_cache:
-                data_cache[key] = fetch_data(*key)
-
-            candles = data_cache[key]
-
-            reference_time = pd.to_datetime(
-                row["candle_time"], utc=True
-            )
-
-            # The first completed candle after the
-            # reference candle is used as the outcome.
-            future = candles[
-                candles["Time"] > reference_time
-            ]
-
-            if future.empty:
+            pair, tf = row["coin"], row["timeframe"]
+            if tf not in DURATION:
+                errors.append(f"{pair} {tf} record {row.get('id')}: unsupported timeframe")
                 continue
+            key = (pair, tf)
+            if key not in candle_cache:
+                candle_cache[key] = fetch_data(pair, tf)
+            candles = candle_cache[key]
 
-            outcome = future.iloc[0]
+            ref_time = pd.to_datetime(row["candle_time"], utc=True)
+            raw_target = row.get("target_candle_time")
+            target_time = (pd.to_datetime(raw_target, utc=True)
+                           if raw_target else ref_time + DURATION[tf])
 
-            open_price = float(outcome["Open"])
-            close_price = float(outcome["Close"])
-            high_price = float(outcome["High"])
-            low_price = float(outcome["Low"])
+            # Exact match only: never score a later candle by mistake.
+            match = candles[candles["Time"] == target_time]
+            if match.empty:
+                continue  # target candle is not yet available as completed data
 
-            if open_price <= 0:
-                errors.append(
-                    f"{key}: invalid outcome opening price."
-                )
+            candle = match.iloc[0]
+            op, cl = float(candle["Open"]), float(candle["Close"])
+            hi, lo = float(candle["High"]), float(candle["Low"])
+            if not np.isfinite(op) or op <= 0:
+                errors.append(f"{pair} {tf} record {row.get('id')}: invalid target open")
                 continue
-
-            actual = int(close_price > open_price)
-
-            body_change_pct = (
-                (close_price - open_price)
-                / open_price * 100
-            )
-
-            full_range_pct = (
-                (high_price - low_price)
-                / open_price * 100
-            )
 
             update_data = {
-                "actual": actual,
-                "outcome_open": open_price,
-                "outcome_close": close_price,
-                "outcome_high": high_price,
-                "outcome_low": low_price,
-                "body_change_pct": body_change_pct,
-                "full_range_pct": full_range_pct,
-                "evaluated_at": datetime.now(
-                    timezone.utc
-                ).isoformat()
+                "target_candle_time": target_time.isoformat(),
+                "actual": int(cl > op),
+                "outcome_open": op, "outcome_close": cl,
+                "outcome_high": hi, "outcome_low": lo,
+                "body_change_pct": (cl - op) / op * 100,
+                "full_range_pct": (hi - lo) / op * 100,
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
             }
-
-            (
-                supabase.table("predictions")
-                .update(update_data)
-                .eq("id", row["id"])
-                .execute()
-            )
-
-            updated += 1
-
+            result = (supabase.table("predictions").update(update_data)
+                      .eq("id", row["id"]).is_("actual", "null").execute())
+            if result.data:
+                updated += 1
         except Exception as e:
-            errors.append(
-                f"{row.get('coin')} {row.get('timeframe')} "
-                f"record {row.get('id')}: {e}"
-            )
-
+            errors.append(f"{row.get('coin')} {row.get('timeframe')} record {row.get('id')}: {e}")
     return updated, errors
 
+left, right = st.columns(2)
+with left:
+    selected_coin = st.selectbox("Crypto pair", PAIRS, key="selected_coin")
+with right:
+    selected_timeframe = st.selectbox("Timeframe", TIMEFRAMES, key="selected_timeframe")
 
-# =========================================
-# USER CONTROLS
-# =========================================
+st.caption("The live panels update every 30 seconds while the app is open. They do not run in the background after the app is closed.")
 
-col1, col2 = st.columns(2)
+if st.button("Evaluate all pairs' pending outcomes"):
+    with st.spinner("Checking pending outcomes..."):
+        count, errors = resolve_pending()
+    st.success(f"Updated outcomes: {count}")
+    if errors:
+        with st.expander(f"Warnings ({len(errors)})"):
+            for msg in errors[:20]:
+                st.warning(msg)
 
-with col1:
-    coin = st.selectbox(
-        "Crypto Pair",
-        ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD"]
-    )
+@st.fragment(run_every="30s")
+def live_panel(coin, timeframe):
+    st.subheader("Live paper-testing panel")
+    st.caption("Last panel check (UTC): " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+    with st.spinner("Checking completed candles..."):
+        resolved_count, outcome_errors = resolve_pending(coin, timeframe)
+        prediction_result, prediction_error = None, None
+        try:
+            prediction_result = make_prediction(coin, timeframe)
+        except Exception as e:
+            prediction_error = str(e)
 
-with col2:
-    timeframe = st.selectbox(
-        "Timeframe",
-        ["1m", "5m", "15m", "1h", "4h", "1d"]
-    )
+    if resolved_count:
+        st.success(f"Newly evaluated outcomes: {resolved_count}")
+    if outcome_errors:
+        with st.expander(f"Outcome warnings ({len(outcome_errors)})"):
+            for msg in outcome_errors[:10]:
+                st.warning(msg)
+    if prediction_error:
+        st.error(f"Prediction check failed: {prediction_error}")
+        return
+    if not prediction_result:
+        st.info("No prediction available yet.")
+        return
 
-st.caption(
-    "Auto mode handles the currently selected pair and timeframe. "
-    "Keep this page open for periodic checks."
-)
-
-evaluate_all_clicked = st.button(
-    "🧪 Evaluate all pending outcomes"
-)
-
-
-# =========================================
-# AUTOMATIC RUN
-# =========================================
-
-with st.spinner("Checking candle outcomes and predictions..."):
-
-    if evaluate_all_clicked:
-        resolved_count, outcome_errors = resolve_pending()
-    else:
-        resolved_count, outcome_errors = resolve_pending(
-            coin=coin,
-            timeframe=timeframe
-        )
-
-    prediction_result = None
-    prediction_error = None
-
-    try:
-        prediction_result = make_prediction(coin, timeframe)
-    except Exception as e:
-        prediction_error = str(e)
-
-
-if resolved_count:
-    st.success(f"Updated outcomes: {resolved_count}")
-
-if outcome_errors:
-    with st.expander(
-        f"Outcome evaluation warnings ({len(outcome_errors)})"
-    ):
-        for message in outcome_errors[:10]:
-            st.warning(message)
-
-if prediction_error:
-    st.error(f"Automatic prediction failed: {prediction_error}")
-
-elif prediction_result:
     if prediction_result["is_new"]:
-        st.success(
-            "New prediction saved to Supabase for the latest completed candle."
-        )
+        st.success("New paper prediction saved.")
     else:
-        st.info(
-            "This candle already has a saved prediction. "
-            "Duplicate prediction skipped."
-        )
+        st.info("This reference candle already has a saved prediction.")
 
     a, b, c = st.columns(3)
-
-    a.metric(
-        "Next Candle Estimate",
-        "UP 🟢"
-        if prediction_result["prediction"] == 1
-        else "DOWN 🔴"
-    )
-
-    up_prob = prediction_result.get("up_probability")
-
-    b.metric(
-        "Model UP Probability",
-        f"{float(up_prob) * 100:.1f}%"
-        if up_prob is not None else "N/A"
-    )
+    a.metric("Next candle estimate", "UP" if prediction_result["prediction"] == 1 else "DOWN")
+    p = prediction_result.get("up_probability")
+    b.metric("Model UP probability", f"{float(p)*100:.1f}%" if p is not None else "N/A")
 
     metrics = latest_model_metrics(coin, timeframe)
-
-    test_accuracy = prediction_result.get("test_accuracy")
-    if test_accuracy is None:
-        test_accuracy = metrics.get("test_accuracy")
-
-    c.metric(
-        "Historical Test Accuracy",
-        f"{float(test_accuracy) * 100:.1f}%"
-        if test_accuracy is not None else "N/A"
-    )
+    acc = prediction_result.get("test_accuracy")
+    if acc is None:
+        acc = metrics.get("test_accuracy")
+    c.metric("Historical holdout accuracy", f"{float(acc)*100:.1f}%" if acc is not None else "N/A")
 
     baseline = prediction_result.get("baseline_accuracy")
     if baseline is None:
         baseline = metrics.get("baseline_accuracy")
-
     if baseline is not None:
-        st.write(
-            "Baseline accuracy:",
-            f"{float(baseline) * 100:.1f}%"
-        )
+        st.caption(f"Baseline holdout accuracy: {float(baseline)*100:.1f}%")
 
-    st.caption(
-        "Historical test accuracy and model probabilities "
-        "do not guarantee future results."
-    )
+    st.write(f"Reference candle time (UTC): `{prediction_result['candle_time']}`")
+    st.write(f"Target candle time (UTC): `{prediction_result['target_candle_time']}`")
+    st.write(f"Reference close: `{prediction_result['reference_close']:.8g}`")
+    st.line_chart(prediction_result["chart"].set_index("Time")["Close"])
+    st.caption("Chart data comes from Kraken; another platform may use a different price feed.")
 
-    st.line_chart(
-        prediction_result["chart"].set_index("Time")["Close"]
-    )
-
-
-# =========================================
-# PAPER TESTING HISTORY
-# =========================================
+live_panel(selected_coin, selected_timeframe)
 
 st.divider()
-st.header("🧪 Paper Testing Results")
+st.header("Paper testing history")
 
-try:
-    response = (
-        supabase.table("predictions")
-        .select("*")
-        .order("created_at", desc=True)
-        .limit(500)
-        .execute()
-    )
+@st.fragment(run_every="20s")
+def history_panel():
+    try:
+        response = (supabase.table("predictions").select("*")
+                    .order("created_at", desc=True).limit(500).execute())
+        history = pd.DataFrame(response.data or [])
+        if history.empty:
+            st.info("No predictions saved yet.")
+            return
 
-    history = pd.DataFrame(response.data or [])
-
-    if history.empty:
-        st.info("No predictions saved yet.")
-    else:
-        required_columns = [
-            "created_at", "coin", "timeframe",
-            "close_price", "prediction", "actual",
-            "outcome_open", "outcome_close",
-            "outcome_high", "outcome_low",
-            "body_change_pct", "full_range_pct"
+        needed = [
+            "created_at", "candle_time", "target_candle_time", "coin", "timeframe",
+            "close_price", "prediction", "actual", "up_probability",
+            "outcome_open", "outcome_close", "outcome_high", "outcome_low",
+            "body_change_pct", "full_range_pct",
         ]
-
-        for col in required_columns:
+        for col in needed:
             if col not in history.columns:
                 history[col] = np.nan
 
-        resolved = history.dropna(
-            subset=["actual", "prediction"]
-        ).copy()
-
+        resolved = history.dropna(subset=["actual", "prediction"]).copy()
         if not resolved.empty:
-            resolved["Correct"] = (
-                resolved["prediction"].astype(int)
-                == resolved["actual"].astype(int)
-            )
-
-            total = len(resolved)
-            correct = int(resolved["Correct"].sum())
-
+            correct_mask = resolved["actual"].astype(int) == resolved["prediction"].astype(int)
+            total, correct = len(resolved), int(correct_mask.sum())
             a, b, c = st.columns(3)
-            a.metric("Evaluated Predictions", total)
+            a.metric("Evaluated predictions", total)
             b.metric("Correct", correct)
-            c.metric(
-                "Paper Accuracy",
-                f"{correct / total * 100:.1f}%"
-            )
+            c.metric("Overall paper accuracy", f"{correct/total*100:.1f}%")
         else:
-            st.info(
-                "Outcomes are pending until the next candle closes "
-                "and is successfully evaluated."
-            )
+            st.info("Outcomes are pending until their target candles are completed.")
 
-        history["Prediction"] = history["prediction"].map(
-            {1: "UP", 0: "DOWN"}
+        history["Prediction"] = history["prediction"].map({1: "UP", 0: "DOWN"})
+        history["Outcome"] = history["actual"].map({1: "UP", 0: "DOWN"}).fillna("Pending")
+        history["Correct?"] = "Pending"
+        mask = history["actual"].notna() & history["prediction"].notna()
+        history.loc[mask, "Correct?"] = np.where(
+            history.loc[mask, "actual"].astype(int) == history.loc[mask, "prediction"].astype(int),
+            "Yes", "No"
         )
-
-        history["Outcome"] = history["actual"].map(
-            {1: "UP", 0: "DOWN"}
-        ).fillna("Pending")
-
-        def movement_label(value):
-            if pd.isna(value):
-                return "Pending"
-
-            magnitude = abs(float(value))
-
-            if magnitude < 0.1:
-                return "Small move"
-            elif magnitude < 0.5:
-                return "Moderate move"
-
-            return "Large move"
-
-        history["Movement"] = history[
-            "body_change_pct"
-        ].apply(movement_label)
-
-        def correctness(row):
-            if pd.isna(row["actual"]) or pd.isna(row["prediction"]):
-                return "Pending"
-
-            return (
-                "Yes"
-                if int(row["prediction"]) == int(row["actual"])
-                else "No"
-            )
-
-        history["Correct?"] = history.apply(
-            correctness, axis=1
-        )
+        history["UP Probability %"] = pd.to_numeric(history["up_probability"], errors="coerce") * 100
 
         display = history[[
-            "created_at",
-            "coin",
-            "timeframe",
-            "close_price",
-            "Prediction",
-            "outcome_open",
-            "outcome_close",
-            "outcome_high",
-            "outcome_low",
-            "body_change_pct",
-            "full_range_pct",
-            "Movement",
-            "Outcome",
-            "Correct?"
+            "created_at", "candle_time", "target_candle_time", "coin", "timeframe",
+            "close_price", "Prediction", "UP Probability %", "outcome_open",
+            "outcome_close", "outcome_high", "outcome_low", "body_change_pct",
+            "full_range_pct", "Outcome", "Correct?"
         ]].rename(columns={
-            "created_at": "Prediction Time",
-            "coin": "Pair",
-            "timeframe": "Timeframe",
-            "close_price": "Reference Close",
-            "outcome_open": "Next Open",
-            "outcome_close": "Next Close",
-            "outcome_high": "Next High",
-            "outcome_low": "Next Low",
-            "body_change_pct": "Body Change %",
-            "full_range_pct": "Full Range %"
+            "created_at": "Created At (UTC)",
+            "candle_time": "Reference Candle (UTC)",
+            "target_candle_time": "Target Candle (UTC)",
+            "coin": "Pair", "timeframe": "Timeframe", "close_price": "Reference Close",
+            "outcome_open": "Target Open", "outcome_close": "Target Close",
+            "outcome_high": "Target High", "outcome_low": "Target Low",
+            "body_change_pct": "Body Change %", "full_range_pct": "Target Full Range %",
         })
+        st.dataframe(display, use_container_width=True, hide_index=True)
+        st.caption("Outcome label means target candle Close > target candle Open. Historical accuracy does not guarantee future results.")
+    except Exception as e:
+        st.error(f"Could not load history: {e}")
 
-        st.dataframe(
-            display,
-            use_container_width=True,
-            hide_index=True
-        )
-
-        st.caption(
-            "Movement labels describe candle body size only. "
-            "They do not mean the prediction is safe. "
-            "Full Range % measures the high-low range relative "
-            "to the next candle's open."
-        )
-
-except Exception as e:
-    st.error(f"Could not load Supabase history: {e}")
+history_panel()

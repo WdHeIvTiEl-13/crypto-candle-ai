@@ -308,7 +308,7 @@ live_panel(selected_coin, selected_timeframe)
 st.divider()
 st.header("Paper testing history")
 
-@st.fragment(run_every="20s")
+@st.fragment(run_every="30s")
 def history_panel():
     try:
         response = (supabase.table("predictions").select("*")
